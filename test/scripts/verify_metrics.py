@@ -251,7 +251,7 @@ def main() -> int:
         f"(expected ~{total_load_writes})",
         flush=True,
     )
-    threshold = max(1, int(total_load_writes * 0.90))
+    threshold = max(1, int(total_load_writes * 0.995))
     if (
         fs_write_ops_metric >= threshold
         and cloud_run_requests_metric >= threshold
