@@ -13,12 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Pub/Sub subscriber job that consumes Firestore change events and validates a sample against Firestore."""
+"""Multi-process Pub/Sub subscriber job that consumes Firestore change events at 1000+ QPS and validates a sample against Firestore."""
 
 from concurrent import futures
 import hashlib
 import json
 import logging
+import multiprocessing
 import os
 import random
 import threading
@@ -65,36 +66,28 @@ def extract_firestore_proto_fields(
   return result
 
 
-def main() -> None:
+def run_worker_process(
+    worker_id: int,
+    num_workers: int,
+    result_queue: "multiprocessing.Queue[dict[str, Any]]",
+) -> None:
+  """Runs an independent StreamingPull subscriber in its own OS process."""
   project_id = os.environ["PROJECT_ID"]
   database_id = os.environ.get("FIRESTORE_DATABASE", "(default)")
   subscription_path = os.environ["PUBSUB_SUBSCRIPTION_PATH"]
   expected_run_id = os.environ.get("RUN_ID", "")
   sample_rate = float(os.environ.get("SAMPLE_RATE", "0.05"))
-  max_sampled_docs = int(os.environ.get("MAX_SAMPLED_DOCS", "500"))
+  total_max_sampled = int(os.environ.get("MAX_SAMPLED_DOCS", "500"))
+  worker_max_sampled = max(10, total_max_sampled // num_workers)
   expected_duration_seconds = float(
       os.environ.get("EXPECTED_DURATION_SECONDS", "20")
   )
   idle_timeout_seconds = float(os.environ.get("IDLE_TIMEOUT_SECONDS", "45"))
   max_runtime_seconds = float(os.environ.get("MAX_RUNTIME_SECONDS", "180"))
 
-  logger.info(
-      "Starting Pub/Sub Subscriber & Validator against subscription=%s "
-      "database=%s run_id=%s sample_rate=%.3f max_sampled_docs=%d "
-      "expected_duration=%.1fs idle_timeout=%.1fs max_runtime=%.1fs",
-      subscription_path,
-      database_id,
-      expected_run_id,
-      sample_rate,
-      max_sampled_docs,
-      expected_duration_seconds,
-      idle_timeout_seconds,
-      max_runtime_seconds,
-  )
-
   session = requests.Session()
   adapter = requests.adapters.HTTPAdapter(
-      pool_connections=64, pool_maxsize=64, max_retries=3
+      pool_connections=32, pool_maxsize=32, max_retries=3
   )
   session.mount("http://", adapter)
   session.mount("https://", adapter)
@@ -110,7 +103,9 @@ def main() -> None:
       try:
         creds.refresh(auth_req)
       except Exception as exc:  # pylint: disable=broad-except
-        logger.warning("Background credential refresh warning: %s", exc)
+        logger.warning(
+            "Worker %d credential refresh warning: %s", worker_id, exc
+        )
 
   threading.Thread(target=refresh_loop, daemon=True).start()
 
@@ -118,7 +113,7 @@ def main() -> None:
       project=project_id, database=database_id, credentials=creds
   )
   subscriber = pubsub_v1.SubscriberClient(credentials=creds)
-  validation_executor = futures.ThreadPoolExecutor(max_workers=32)
+  validation_executor = futures.ThreadPoolExecutor(max_workers=8)
 
   lock = threading.Lock()
   start_time = time.monotonic()
@@ -177,9 +172,7 @@ def main() -> None:
       with lock:
         sampled_docs_checked += 1
         sampled_docs_failed += 1
-      logger.warning(
-          "Error validating sampled document %s: %s", doc_path, exc
-      )
+      logger.warning("Error validating sampled document %s: %s", doc_path, exc)
 
   def callback(message: pubsub_v1.subscriber.message.Message) -> None:
     nonlocal raw_messages_received, matching_run_messages, last_message_time
@@ -238,7 +231,7 @@ def main() -> None:
           envelope_invalid_count += 1
         if (
             is_valid
-            and len(validation_futures) < max_sampled_docs
+            and len(validation_futures) < worker_max_sampled
             and random.random() < sample_rate
         ):
           should_sample = True
@@ -257,9 +250,9 @@ def main() -> None:
         last_message_time = now
       logger.warning("Failed to parse Pub/Sub message: %s", exc)
 
-  flow_control = pubsub_v1.types.FlowControl(max_messages=5000)
+  flow_control = pubsub_v1.types.FlowControl(max_messages=2500)
   callback_scheduler = pubsub_v1.subscriber.scheduler.ThreadScheduler(
-      futures.ThreadPoolExecutor(max_workers=32)
+      futures.ThreadPoolExecutor(max_workers=16)
   )
   streaming_pull_future = subscriber.subscribe(
       subscription_path,
@@ -268,6 +261,7 @@ def main() -> None:
       scheduler=callback_scheduler,
   )
 
+  last_log_time = time.monotonic()
   try:
     while True:
       time.sleep(2.0)
@@ -279,31 +273,34 @@ def main() -> None:
         unique_cnt = len(unique_documents)
         sampled_cnt = sampled_docs_checked
 
-      logger.info(
-          "Subscriber progress: raw=%d matched=%d unique_docs=%d "
-          "sampled_checked=%d idle=%.1fs elapsed=%.1fs",
-          raw_messages_received,
-          matched,
-          unique_cnt,
-          sampled_cnt,
-          idle,
-          elapsed,
-      )
-
-      if (
-          matched > 0
-          and elapsed >= expected_duration_seconds
-          and idle >= idle_timeout_seconds
-      ):
+      if worker_id == 0 and (now - last_log_time) >= 15.0:
+        last_log_time = now
         logger.info(
-            "Subscription idle for %.1fs after receiving %d messages; finishing.",
+            "Worker %d/%d progress: raw=%d matched=%d unique_docs=%d "
+            "sampled_checked=%d idle=%.1fs elapsed=%.1fs",
+            worker_id,
+            num_workers,
+            raw_messages_received,
+            matched,
+            unique_cnt,
+            sampled_cnt,
             idle,
+            elapsed,
+        )
+
+      if elapsed >= expected_duration_seconds and idle >= idle_timeout_seconds:
+        logger.info(
+            "Worker %d subscription idle for %.1fs after %.1fs elapsed (matched=%d); finishing.",
+            worker_id,
+            idle,
+            elapsed,
             matched,
         )
         break
       if elapsed >= max_runtime_seconds:
         logger.info(
-            "Reached max_runtime_seconds (%.1fs); finishing.",
+            "Worker %d reached max_runtime_seconds (%.1fs); finishing.",
+            worker_id,
             max_runtime_seconds,
         )
         break
@@ -318,9 +315,8 @@ def main() -> None:
   validation_executor.shutdown(wait=True)
   subscriber.close()
 
-  elapsed = max(0.001, time.monotonic() - start_time)
-  summary = {
-      "run_id": expected_run_id,
+  result_queue.put({
+      "worker_id": worker_id,
       "raw_messages_received": raw_messages_received,
       "matching_run_messages": matching_run_messages,
       "unique_documents_received": len(unique_documents),
@@ -330,6 +326,73 @@ def main() -> None:
       "sampled_docs_matched": sampled_docs_matched,
       "sampled_docs_failed": sampled_docs_failed,
       "collection_group_counts": collection_group_counts,
+  })
+
+
+def main() -> None:
+  expected_run_id = os.environ.get("RUN_ID", "")
+  num_workers = int(os.environ.get("SUBSCRIBER_PROCESSES", "6"))
+  start_time = time.monotonic()
+
+  logger.info(
+      "Launching %d parallel StreamingPull subscriber processes (run_id=%s)...",
+      num_workers,
+      expected_run_id,
+  )
+
+  ctx = multiprocessing.get_context("spawn")
+  result_queue: multiprocessing.Queue[dict[str, Any]] = ctx.Queue()
+  procs = [
+      ctx.Process(
+          target=run_worker_process,
+          args=(i, num_workers, result_queue),
+      )
+      for i in range(num_workers)
+  ]
+  for p in procs:
+    p.start()
+
+  results: list[dict[str, Any]] = []
+  for _ in range(num_workers):
+    results.append(result_queue.get())
+
+  for p in procs:
+    p.join(timeout=30)
+
+  total_cg_counts: dict[str, int] = {}
+  for r in results:
+    for cg, cnt in r.get("collection_group_counts", {}).items():
+      total_cg_counts[cg] = total_cg_counts.get(cg, 0) + int(cnt)
+
+  elapsed = max(0.001, time.monotonic() - start_time)
+  summary = {
+      "run_id": expected_run_id,
+      "worker_processes": len(results),
+      "raw_messages_received": sum(
+          int(r["raw_messages_received"]) for r in results
+      ),
+      "matching_run_messages": sum(
+          int(r["matching_run_messages"]) for r in results
+      ),
+      "unique_documents_received": sum(
+          int(r["unique_documents_received"]) for r in results
+      ),
+      "envelope_valid_count": sum(
+          int(r["envelope_valid_count"]) for r in results
+      ),
+      "envelope_invalid_count": sum(
+          int(r["envelope_invalid_count"]) for r in results
+      ),
+      "sampled_docs_checked": sum(
+          int(r["sampled_docs_checked"]) for r in results
+      ),
+      "sampled_docs_matched": sum(
+          int(r["sampled_docs_matched"]) for r in results
+      ),
+      "sampled_docs_failed": sum(
+          int(r["sampled_docs_failed"]) for r in results
+      ),
+      "collection_group_counts": total_cg_counts,
       "elapsed_seconds": round(elapsed, 2),
   }
   print(f"SUBSCRIBER_SUMMARY: {json.dumps(summary)}", flush=True)

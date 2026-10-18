@@ -62,19 +62,38 @@ gcloud run jobs execute "${SUB_JOB_NAME}" \
   --region="${REGION}" \
   --task-timeout="${JOB_TIMEOUT}s" \
   --update-env-vars="RUN_ID=${RUN_ID},EXPECTED_DURATION_SECONDS=${DURATION_SECONDS},MAX_RUNTIME_SECONDS=${MAX_RUNTIME}" \
-  --wait &
-SUB_PID=$!
+  --async
 
-echo "Executing Firestore Load Generator Cloud Run Job (${LOAD_JOB_NAME}) at up to ${TARGET_QPS} QPS..."
+echo "Starting Firestore Load Generator Cloud Run Job (${LOAD_JOB_NAME}) at up to ${TARGET_QPS} QPS for ${DURATION_SECONDS}s..."
 gcloud run jobs execute "${LOAD_JOB_NAME}" \
   --project="${PROJECT_ID}" \
   --region="${REGION}" \
   --task-timeout="${JOB_TIMEOUT}s" \
   --update-env-vars="RUN_ID=${RUN_ID},DURATION_SECONDS=${DURATION_SECONDS},TARGET_QPS=${TARGET_QPS}" \
-  --wait
+  --async
 
-echo "Load Generator finished. Waiting for Pub/Sub Subscriber Job (${SUB_JOB_NAME}) to drain and validate sample..."
-wait "${SUB_PID}"
+wait_for_job() {
+  local job_name="$1"
+  echo "Waiting for Cloud Run Job ${job_name} latest execution to complete..."
+  while true; do
+    local comp_time=""
+    comp_time="$(gcloud run jobs executions list \
+      --job="${job_name}" \
+      --project="${PROJECT_ID}" \
+      --region="${REGION}" \
+      --limit=1 \
+      --format="value(status.completionTime)" 2>/dev/null || true)"
+    if [[ -n "${comp_time}" ]]; then
+      echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] Job ${job_name} completed at ${comp_time}"
+      break
+    fi
+    echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] Job ${job_name} still running..."
+    sleep 30
+  done
+}
+
+wait_for_job "${LOAD_JOB_NAME}"
+wait_for_job "${SUB_JOB_NAME}"
 
 python3 "${SCRIPT_DIR}/scripts/verify_metrics.py" \
   --project="${PROJECT_ID}" \

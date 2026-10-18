@@ -213,8 +213,8 @@ resource "google_cloud_run_v2_job" "pubsub_subscriber" {
 
         resources {
           limits = {
-            cpu    = "4"
-            memory = "4Gi"
+            cpu    = "8"
+            memory = "8Gi"
           }
         }
 
