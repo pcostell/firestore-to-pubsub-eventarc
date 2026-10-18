@@ -1,0 +1,17 @@
+project_id = "my-gcp-project-id"
+region     = "us-central1"
+
+# 1. Target Firestore Database
+database           = "(default)"
+firestore_location = "nam5" # Or match `region` (e.g., "us-central1") for single-region databases
+create_database    = false
+
+# 2. Target Pub/Sub Topic
+pubsub_topic        = "firestore-document-changes"
+create_pubsub_topic = true
+
+# 3. Optional Subset of Firestore Collection Groups to Sync
+# Leave empty (`[]`) to sync ALL document changes in the database.
+# Specify collection group names (e.g., ["users", "orders"]) to sync only those collection groups
+# (matches both root collections `orders/{id}` and subcollections `users/{uid}/orders/{id}`).
+collection_groups = []
