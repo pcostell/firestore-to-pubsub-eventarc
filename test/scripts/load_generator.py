@@ -60,6 +60,16 @@ def create_warmed_clients(
   )
   creds.refresh(auth_req)
 
+  def refresh_loop() -> None:
+    while True:
+      time.sleep(900)
+      try:
+        creds.refresh(auth_req)
+      except Exception as exc:  # pylint: disable=broad-except
+        logger.warning("Background credential refresh warning: %s", exc)
+
+  threading.Thread(target=refresh_loop, daemon=True).start()
+
   clients = [
       firestore.Client(
           project=project_id, database=database_id, credentials=creds

@@ -51,6 +51,8 @@ echo "Waiting 15s for Eventarc trigger readiness on database ${DATABASE_ID}..."
 sleep 15
 
 RUN_ID="run-$(date -u +%s)"
+JOB_TIMEOUT="$((DURATION_SECONDS + 900))"
+MAX_RUNTIME="$((DURATION_SECONDS + 600))"
 START_TIME="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 echo "Test window start time: ${START_TIME} (RUN_ID=${RUN_ID})"
 
@@ -58,7 +60,8 @@ echo "Starting Pub/Sub Subscriber & Validator Cloud Run Job (${SUB_JOB_NAME})...
 gcloud run jobs execute "${SUB_JOB_NAME}" \
   --project="${PROJECT_ID}" \
   --region="${REGION}" \
-  --update-env-vars="RUN_ID=${RUN_ID}" \
+  --task-timeout="${JOB_TIMEOUT}s" \
+  --update-env-vars="RUN_ID=${RUN_ID},EXPECTED_DURATION_SECONDS=${DURATION_SECONDS},MAX_RUNTIME_SECONDS=${MAX_RUNTIME}" \
   --wait &
 SUB_PID=$!
 
@@ -66,7 +69,8 @@ echo "Executing Firestore Load Generator Cloud Run Job (${LOAD_JOB_NAME}) at up 
 gcloud run jobs execute "${LOAD_JOB_NAME}" \
   --project="${PROJECT_ID}" \
   --region="${REGION}" \
-  --update-env-vars="RUN_ID=${RUN_ID}" \
+  --task-timeout="${JOB_TIMEOUT}s" \
+  --update-env-vars="RUN_ID=${RUN_ID},DURATION_SECONDS=${DURATION_SECONDS},TARGET_QPS=${TARGET_QPS}" \
   --wait
 
 echo "Load Generator finished. Waiting for Pub/Sub Subscriber Job (${SUB_JOB_NAME}) to drain and validate sample..."

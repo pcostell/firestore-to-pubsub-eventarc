@@ -131,7 +131,7 @@ resource "google_cloud_run_v2_job" "load_generator" {
 
     template {
       service_account = google_service_account.test_jobs_sa.email
-      timeout         = "600s"
+      timeout         = "${max(600, var.duration_seconds + 900)}s"
       max_retries     = 0
 
       containers {
@@ -201,7 +201,7 @@ resource "google_cloud_run_v2_job" "pubsub_subscriber" {
 
     template {
       service_account = google_service_account.test_jobs_sa.email
-      timeout         = "600s"
+      timeout         = "${max(600, var.duration_seconds + 900)}s"
       max_retries     = 0
 
       containers {
@@ -240,11 +240,15 @@ resource "google_cloud_run_v2_job" "pubsub_subscriber" {
         }
         env {
           name  = "IDLE_TIMEOUT_SECONDS"
-          value = "25"
+          value = "45"
+        }
+        env {
+          name  = "EXPECTED_DURATION_SECONDS"
+          value = tostring(var.duration_seconds)
         }
         env {
           name  = "MAX_RUNTIME_SECONDS"
-          value = "180"
+          value = tostring(max(180, var.duration_seconds + 600))
         }
         env {
           name  = "PYTHON_SCRIPT"

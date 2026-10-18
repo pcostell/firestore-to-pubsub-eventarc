@@ -72,18 +72,22 @@ def main() -> None:
   expected_run_id = os.environ.get("RUN_ID", "")
   sample_rate = float(os.environ.get("SAMPLE_RATE", "0.05"))
   max_sampled_docs = int(os.environ.get("MAX_SAMPLED_DOCS", "500"))
-  idle_timeout_seconds = float(os.environ.get("IDLE_TIMEOUT_SECONDS", "25"))
+  expected_duration_seconds = float(
+      os.environ.get("EXPECTED_DURATION_SECONDS", "20")
+  )
+  idle_timeout_seconds = float(os.environ.get("IDLE_TIMEOUT_SECONDS", "45"))
   max_runtime_seconds = float(os.environ.get("MAX_RUNTIME_SECONDS", "180"))
 
   logger.info(
       "Starting Pub/Sub Subscriber & Validator against subscription=%s "
       "database=%s run_id=%s sample_rate=%.3f max_sampled_docs=%d "
-      "idle_timeout=%.1fs max_runtime=%.1fs",
+      "expected_duration=%.1fs idle_timeout=%.1fs max_runtime=%.1fs",
       subscription_path,
       database_id,
       expected_run_id,
       sample_rate,
       max_sampled_docs,
+      expected_duration_seconds,
       idle_timeout_seconds,
       max_runtime_seconds,
   )
@@ -100,6 +104,16 @@ def main() -> None:
   )
   creds.refresh(auth_req)
 
+  def refresh_loop() -> None:
+    while True:
+      time.sleep(900)
+      try:
+        creds.refresh(auth_req)
+      except Exception as exc:  # pylint: disable=broad-except
+        logger.warning("Background credential refresh warning: %s", exc)
+
+  threading.Thread(target=refresh_loop, daemon=True).start()
+
   fs_client = firestore.Client(
       project=project_id, database=database_id, credentials=creds
   )
@@ -112,7 +126,7 @@ def main() -> None:
 
   raw_messages_received = 0
   matching_run_messages = 0
-  unique_documents: set[str] = set()
+  unique_documents: set[bytes] = set()
   envelope_valid_count = 0
   envelope_invalid_count = 0
   sampled_docs_checked = 0
@@ -210,10 +224,13 @@ def main() -> None:
           and actual_hash == expected_hash
       )
 
+      doc_digest = hashlib.blake2b(
+          doc_path.encode("utf-8"), digest_size=8
+      ).digest()
       should_sample = False
       with lock:
         matching_run_messages += 1
-        unique_documents.add(doc_path)
+        unique_documents.add(doc_digest)
         collection_group_counts[cg] = collection_group_counts.get(cg, 0) + 1
         if is_valid:
           envelope_valid_count += 1
@@ -241,10 +258,14 @@ def main() -> None:
       logger.warning("Failed to parse Pub/Sub message: %s", exc)
 
   flow_control = pubsub_v1.types.FlowControl(max_messages=5000)
+  callback_scheduler = pubsub_v1.subscriber.scheduler.ThreadScheduler(
+      futures.ThreadPoolExecutor(max_workers=32)
+  )
   streaming_pull_future = subscriber.subscribe(
       subscription_path,
       callback=callback,
       flow_control=flow_control,
+      scheduler=callback_scheduler,
   )
 
   try:
@@ -269,7 +290,11 @@ def main() -> None:
           elapsed,
       )
 
-      if matched > 0 and idle >= idle_timeout_seconds:
+      if (
+          matched > 0
+          and elapsed >= expected_duration_seconds
+          and idle >= idle_timeout_seconds
+      ):
         logger.info(
             "Subscription idle for %.1fs after receiving %d messages; finishing.",
             idle,

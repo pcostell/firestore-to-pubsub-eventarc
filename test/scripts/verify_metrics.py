@@ -45,30 +45,39 @@ def query_monitoring_sum(
     end_iso: str,
 ) -> int:
   """Queries Cloud Monitoring timeSeries API and sums all INT64/DOUBLE points."""
-  params = urllib.parse.urlencode({
-      "filter": metric_filter,
-      "interval.startTime": start_iso,
-      "interval.endTime": end_iso,
-  })
-  url = f"https://monitoring.googleapis.com/v3/projects/{project_id}/timeSeries?{params}"
-  req = urllib.request.Request(
-      url, headers={"Authorization": f"Bearer {token}"}
-  )
-  try:
-    with urllib.request.urlopen(req, timeout=30) as resp:
-      payload = json.loads(resp.read().decode("utf-8"))
-  except Exception as exc:  # pylint: disable=broad-except
-    print(f"Warning: monitoring query failed for {metric_filter}: {exc}")
-    return 0
-
   total = 0
-  for ts in payload.get("timeSeries", []):
-    for pt in ts.get("points", []):
-      val = pt.get("value", {})
-      if "int64Value" in val:
-        total += int(val["int64Value"])
-      elif "doubleValue" in val:
-        total += int(val["doubleValue"])
+  page_token = ""
+  while True:
+    query_dict = {
+        "filter": metric_filter,
+        "interval.startTime": start_iso,
+        "interval.endTime": end_iso,
+        "pageSize": "1000",
+    }
+    if page_token:
+      query_dict["pageToken"] = page_token
+    params = urllib.parse.urlencode(query_dict)
+    url = f"https://monitoring.googleapis.com/v3/projects/{project_id}/timeSeries?{params}"
+    req = urllib.request.Request(
+        url, headers={"Authorization": f"Bearer {token}"}
+    )
+    try:
+      with urllib.request.urlopen(req, timeout=30) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:  # pylint: disable=broad-except
+      print(f"Warning: monitoring query failed for {metric_filter}: {exc}")
+      return total
+
+    for ts in payload.get("timeSeries", []):
+      for pt in ts.get("points", []):
+        val = pt.get("value", {})
+        if "int64Value" in val:
+          total += int(val["int64Value"])
+        elif "doubleValue" in val:
+          total += int(val["doubleValue"])
+    page_token = str(payload.get("nextPageToken") or "")
+    if not page_token:
+      break
   return total
 
 
